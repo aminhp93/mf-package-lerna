@@ -1,0 +1,70 @@
+image: node:16
+
+definitions:
+  caches:
+    npm: $HOME/.npm
+    sonarqube: /opt/sonar-scanner/.sonar/cache
+  services:
+    docker:
+      memory: 7168
+  steps:
+    - step: &qa-build
+        name: Quality Assurante & Build
+        caches:
+          - node
+        script:
+          - npm config set loglevel=verbose
+          - mv .npmrc_template .npmrc
+          - echo -e "\n//nexus.piscada.tools/repository/npm-group/:_password=$(echo -n "$NEXUS_NPM_PUBLISH_PASSWORD" | openssl enc -base64)"  >> .npmrc
+          - echo -e "\n//nexus.piscada.tools/repository/npm-group/:username=$NEXUS_NPM_PUBLISH_USERNAME"  >> .npmrc
+          - yarn install
+          # Code lint
+          - yarn lint --max-warnings=0
+          # Format documents
+          - yarn fmt
+          # Unit tests
+          - yarn test-ci
+          - yarn build
+    - step: &build-publish
+        name: Build & Publish
+        script:
+          - npm version $BITBUCKET_TAG
+          - npm config set loglevel=verbose
+          - mv .npmrc_template .npmrc
+          - echo -e "\n//nexus.piscada.tools/repository/npm-group/:_password=$(echo -n "$NEXUS_NPM_PUBLISH_PASSWORD" | openssl enc -base64)"  >> .npmrc
+          - echo -e "\n//nexus.piscada.tools/repository/npm-group/:username=$NEXUS_NPM_PUBLISH_USERNAME"  >> .npmrc
+          - echo -e "\n//nexus.piscada.tools/repository/npm-hosted/:_password=$(echo -n "$NEXUS_NPM_PUBLISH_PASSWORD" | openssl enc -base64)"  >> .npmrc
+          - echo -e "\n//nexus.piscada.tools/repository/npm-hosted/:username=$NEXUS_NPM_PUBLISH_USERNAME"  >> .npmrc
+          - yarn install
+          - yarn build
+          - npm publish
+    - step: &sonar-qube-scan
+        name: SonarQube Scan
+        image: sonarsource/sonar-scanner-cli:4
+        caches:
+          - sonarqube
+        script:
+          - sonar-scanner -Dsonar.projectKey=piscada.foresight.common-ui-components -Dsonar.projectName="Foresight Common UI Components" -Dsonar.sources=. -Dsonar.host.url=https://sonarqube.piscada.tools -Dsonar.login=$SONAR_LOGIN
+    - step: &sbom
+        name: Generate and upload SBOM
+        image: atlassian/default-image:3
+        size: 2x
+        services:
+          - docker
+        caches:
+          - docker
+        script:
+          - docker run --rm --volume $PWD:/workdir anchore/syft packages dir:/workdir --output cyclonedx-json --file /workdir/sbom.json
+          - 'curl -w "\nUploading SBOM \nType: %{content_type}\nResponse code: %{response_code}\nBytes uploaded: %{size_upload}\n" -X "POST" "https://dependency-track.piscada.tools/api/v1/bom" -H "Content-Type: multipart/form-data" -H "X-Api-Key: ${DEPTRACK_API_KEY}"  -F "autoCreate=true" -F "projectName=foresight-common-ui-components" -F "bom=@./sbom.json"'
+        artifacts:
+          - sbom.json
+pipelines:
+  default:
+    - step: *qa-build
+  branches:
+    main:
+      - step: *sonar-qube-scan
+      - step: *sbom
+  tags:
+    "[0-9]*":
+      - step: *build-publish
